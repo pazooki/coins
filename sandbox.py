@@ -14,18 +14,19 @@ class Test:
 
 async def main():
     # client = Client(api_key=TESTNET_CONFIG['API_KEY'], api_secret=TESTNET_CONFIG['API_SECRET'], testnet=True)
-    # client = Client(api_key=CONFIG['API_KEY'], api_secret=CONFIG['API_SECRET'])
-    twm = ThreadedWebsocketManager(api_key=TESTNET_CONFIG['API_KEY'], api_secret=TESTNET_CONFIG['API_SECRET'], testnet=True)
+    client = Client(api_key=CONFIG['API_KEY'], api_secret=CONFIG['API_SECRET'])
 
-    twm.start()
-
-    t = Test()
-
-    print('calling symbol_ticker_socket... ')
-    ts = twm.start_aggtrade_socket(t.test, symbol='BTCUSDT')
-    print(ts)
-
-    twm.join()
+    # print([i for i in client.get_margin_account()['userAssets'] if i['asset'] in ['BTC', 'USDT']])
+    orders = client.get_all_margin_orders(symbol='BTCUSDT', limit=4)
+    for o in orders:
+        print(o)
+    # twm = ThreadedWebsocketManager(api_key=TESTNET_CONFIG['API_KEY'], api_secret=TESTNET_CONFIG['API_SECRET'], testnet=True)
+    # twm.start()
+    # t = Test()
+    # print('calling symbol_ticker_socket... ')
+    # ts = twm.start_aggtrade_socket(t.test, symbol='BTCUSDT')
+    # print(ts)
+    # twm.join()
     # async with ts as ts:
     #     while True:
     #         trade_price_data = await ts.recv()
@@ -38,3 +39,5 @@ if __name__ == '__main__':
     except (Exception, KeyboardInterrupt) as ex:
         print('Error: ', ex)
         print('Shutting down...')
+
+

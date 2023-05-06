@@ -33,3 +33,7 @@ def ts_filename():
 
 def find_nearest_price(prices, target_price):
     return min(prices, key=lambda x: abs(x - target_price))
+
+
+def diff_pct(first_value, second_value):
+    return ((second_value - first_value) / first_value) * 100

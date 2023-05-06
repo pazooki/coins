@@ -9,8 +9,8 @@ import talib
 from decimal import Decimal
 from binance.enums import *
 
-from strategies.strategy import Strategy, Position, POS_INIT
-from utils import find_nearest_price, get_ema_slope_degrees, filters_to_signals, truncate
+from strategies.strategy import POS_LOSS, POS_WIN, Strategy, Position, POS_INIT
+from utils import diff_pct, find_nearest_price, get_ema_slope_degrees, filters_to_signals, truncate
 
 
 BTCUSDT = 'BTCUSDT'
@@ -48,6 +48,7 @@ class DarkSteps(Strategy):
             self, 
             rest_client, 
             testing=True,
+            margin_testing=False,
             is_isolated_margin=False,
             is_cross_margin=False,
             leverage=1,
@@ -55,12 +56,14 @@ class DarkSteps(Strategy):
             fees_pct=Decimal('0.10'), 
             stop_loss_pct=Decimal('0.1'),
             take_profit_pct=Decimal('0.1'),
+            min_profitable_pct=Decimal('0.12'),
             # model_rfr,
             trades_history=None
         ):
         super().__init__(
             rest_client, 
-            testing=testing, 
+            testing=testing,
+            margin_testing=margin_testing,
             is_isolated_margin=is_isolated_margin,
             is_cross_margin=is_cross_margin,
             leverage=leverage, 
@@ -68,6 +71,7 @@ class DarkSteps(Strategy):
             fees_pct=fees_pct, 
             stop_loss_pct=stop_loss_pct, 
             take_profit_pct=take_profit_pct,
+            min_profitable_pct=min_profitable_pct,
             trades_history=trades_history
         )
         # self.model_rfr = model_rfr
@@ -84,39 +88,57 @@ class DarkSteps(Strategy):
 
     def init_position(self):
         if self.is_first_order:
-            current_price = self.current_price
-            if self.balance['BTC'] > self.BALANCE_MIN_BTC:
-                self.position = Position(
-                    open_price=current_price, 
-                    btc_qty=self.balance['BTC'], 
-                    side=SIDE_BUY,
-                    fees_pct=self.fees_pct
-                )
-            elif self.balance['USDT'] > self.BALANCE_MIN_USDT:
-                self.position = Position(
-                    open_price=current_price, 
-                    btc_qty=self.balance['USDT'] / current_price,
-                    side=SIDE_SELL,
-                    fees_pct=self.fees_pct
-                )
+            print('init_position>   is_first_order: ', self.is_first_order)
+
+            if self.is_cross_margin:
+                last_order = self.rest_client.get_all_margin_orders(symbol=BTCUSDT, limit=1)[0]
+                c_q_qty = Decimal(last_order['cummulativeQuoteQty'])
+                executed_qty = Decimal(last_order['executedQty'])
+                if last_order['side'] == SIDE_BUY:
+                    self.position = Position(
+                        open_price=c_q_qty / executed_qty, 
+                        btc_qty=executed_qty, 
+                        side=SIDE_BUY,
+                        fees_pct=self.fees_pct
+                    )
+                elif last_order['side'] == SIDE_SELL:
+                    self.position = Position(
+                        open_price=c_q_qty / executed_qty, 
+                        btc_qty=executed_qty, 
+                        side=SIDE_SELL,
+                        fees_pct=self.fees_pct
+                    )
+            else:
+                current_price = self.current_price
+                if self.balance['BTC'] > self.BALANCE_MIN_BTC:
+                    self.position = Position(
+                        open_price=current_price, 
+                        btc_qty=self.balance['BTC'], 
+                        side=SIDE_BUY,
+                        fees_pct=self.fees_pct
+                    )
+                elif self.balance['USDT'] > self.BALANCE_MIN_USDT:
+                    self.position = Position(
+                        open_price=current_price, 
+                        btc_qty=self.balance['USDT'] / current_price,
+                        side=SIDE_SELL,
+                        fees_pct=self.fees_pct
+                    )
             # in case of INIT we only use current_price for both open_price and close_price
             if self.position is None:
                 raise Exception('Change BALANCE_MIN_USDT and BALANCE_MIN_BTC to reflect account balance.')
             else:
-                self.position.close(current_price, POS_INIT)
-                print('POSITION INIT: ', self.position.__dict__)
-                self.trades.append(self.position)
-                self.position = None
                 self.is_first_order = False
+            #     self.position.close(current_price, POS_INIT)
+            #     print('POSITION INIT: ', self.position.__dict__)
+            #     self.trades.append(self.position)
+            #     self.position = None
 
 
     def bid(self):
-        print('ON SIDE: ', self.current_side)
-        print('LAST PRICE: ', self.last_price)
         self.init_position()
 
-        # price_mode, price_direction = self.analyze_depth()
-        # print('DEPTH>   MODE: {mode}    DIRECTION: {direction:.2f}'.format(mode=price_mode, direction=price_direction))
+        price_mode, price_direction = self.analyze_depth()
 
         long_signals = filters_to_signals(self.long_condition_is_valid)
         short_signals = filters_to_signals(self.short_condition_is_valid)
@@ -128,7 +150,7 @@ class DarkSteps(Strategy):
             self.balance['USDT'] > self.BALANCE_MIN_USDT,
             long_signals > short_signals,
             long_signals >= self.SIGNAL_THRESHOLD,
-            # price_mode in ['SUPPORT']
+            price_mode in ['SUPPORT']
         ])
 
         can_sell = all([
@@ -136,186 +158,168 @@ class DarkSteps(Strategy):
             self.balance['BTC'] > self.BALANCE_MIN_BTC,
             short_signals > long_signals,
             short_signals >= self.SIGNAL_THRESHOLD,
-            # price_mode in ['RESISTANCE']
+            price_mode in ['RESISTANCE']
         ])
 
-        print('SIGNALS>     LONG: %s    SHORT: %s   Buy: %s  Sell: %s' % (
-            str(long_signals), str(short_signals), can_buy, can_sell
+        header = {}
+        header.update(self.balance)
+        header.update(dict(
+            side=self.current_side, 
+            tp=self.TAKE_PROFIT_PCT, 
+            sl=self.STOP_LOSS_PCT, 
+            st_at=self.time__started.strftime("%d-%H:%M:%S"),
+            cur_at=self.time__current.strftime("%d-%H:%M:%S")
+        ))
+        print('BALANCE:  {BTC:.8f} BTC   {USDT:.2f} USDT    |   SIDE: {side}    |   TP: {tp}%    SL: {sl}%   |   ST@: {st_at}     CUR@: {cur_at}'.format(**header))
+        print('-' * 140)
+        print('SIGS>  L: %d    S: %d     |   CAN>    Buy: %s    Sell: %s     |     DIRECTION: %.2f      MODE: %s' % (
+            long_signals, short_signals, can_buy, can_sell, price_direction, price_mode
+        ))
+        print('-' * 140)
+        print('POS>   PRICE: %.2f   -  CUR PRICE: %.2f   =   DIFF: %.2f    PL_PCT: %.4f%%' % (
+            self.position.open_price,
+            self.last_price,
+            self.last_price - self.position.open_price,
+            self.position.calc_pl_pct(self.last_price)
         ))
 
-        if self.position is not None:
-            print(
-                'POS STATUS>     POS_PL_PCT: %f%%    POS_PRICE: %f   LAST PRICE: %f  DIFF: %f' % (
-                    self.position.calc_pl_pct(self.last_price),
-                    self.position.open_price,
-                    self.last_price,
-                    self.last_price - self.position.open_price
-                )
-            )
-            
-            if self.position.side == SIDE_SELL:
-                # print('pl_pct: ', self.position.calc_pl_pct(self.last_price))
+        print('STATS> T#: %d     WINS: %d     LOSSES: %d' % (
+            len(self.trades),
+            sum(1 if t == POS_WIN else 0 for t in list(self.trades_history.status)),
+            sum(1 if t == POS_LOSS else 0 for t in list(self.trades_history.status))
+        ))
 
-                # included the fees when checking PL pct here inside calc_pl_pct.
-                take_profit_trigger = self.position.calc_pl_pct(self.last_price) <= self.TAKE_PROFIT_PCT
-                stop_loss_trigger = self.position.calc_pl_pct(self.last_price) >= self.STOP_LOSS_PCT
-                if take_profit_trigger: #and price_direction > self.last_price and price_mode in ['RESISTANCE']:
-                    print('TAKE-PROFIT - CLOSED=WIN')
-                    self.position.take_profit(self.last_price)
-                    self.trades.append(self.position)
-                    self.position = None
-                elif stop_loss_trigger: # and price_mode in ['RESISTANCE']:
-                    print('STOP-LOSS - CLOSED=LOSS')
-                    self.position.stop_loss(self.last_price)
-                    self.trades.append(self.position)
-                    self.position = None
-                else:
-                    print('POSITION WAITING TO REACH ENOUGH ACTION THRESHOLD.')
-            elif self.position.side == SIDE_BUY:
-                # print('pl_pct: ', self.position.calc_pl_pct(self.last_price))
-                take_profit_trigger = self.position.calc_pl_pct(self.last_price) >= self.TAKE_PROFIT_PCT
-                stop_loss_trigger = self.position.calc_pl_pct(self.last_price) <= self.STOP_LOSS_PCT
-                
-                if take_profit_trigger: # and not price_direction > self.last_price and price_mode in ['RESISTANCE']:
-                    print('TAKE-PROFIT - CLOSED=WIN')
-                    self.position.take_profit(self.last_price)
-                    self.trades.append(self.position)
-                    self.position = None
-                elif stop_loss_trigger: # and price_direction < self.last_price:
-                    print('STOP-LOSS - CLOSED=LOSS')
-                    self.position.stop_loss(self.last_price)
-                    self.trades.append(self.position)
-                    self.position = None
-                else:
-                    print('POSITION WAITING TO REACH ENOUGH ACTION THRESHOLD.')
-        else:
-            if filters_to_signals(self.cannot_enter) > 1:
-                print('WAIT TO BUY @ PROFT PCT:   %f >= %f  AND  %f <= %f' % (
-                    self.trades[-1].calc_close_pl_pct(self.last_price), (-1 * (self.TAKE_PROFIT_PCT / 2)),
-                    self.trades[-1].calc_close_pl_pct(self.last_price), (self.TAKE_PROFIT_PCT / 2),
-                ))
-                print('########## WATCHING FOR ENTRY...')
-            elif any(self.can_enter):
-                print('ENTRY CRITERIA: MET')
-                if can_buy:
-                    attempts = 0
-                    while attempts < self.ORDERS_MAX_TRIES:
-                        try:
-                            if self.is_cross_margin:
-                                self.long_all_market()
-                            else:
-                                self.buy_all_market()
-                            break
-                        except Exception as e:
-                            print(e)
-                            # time.sleep(0.2)
-                            attempts += 1
-                elif can_sell:
-                    attempts = 0
-                    while attempts < self.ORDERS_MAX_TRIES:
-                        try:
-                            if self.is_cross_margin:
-                                self.short_all_market()
-                            else:
-                                self.sell_all_market()
-                            break
-                        except Exception as e:
-                            print(e)
-                            # time.sleep(0.2)
-                            attempts += 1
-                else:
-                    print('Going to WAIT more')
+        if not self.can_enter:
+            # print('CANNOT ENTER')
+            return None
+        
+        if self.position.side == SIDE_SELL and can_buy and price_mode in ['SUPPORT']:
+            # included the fees when checking PL pct here inside calc_pl_pct.
+            take_profit_trigger = self.position.calc_pl_pct(self.last_price) <= self.TAKE_PROFIT_PCT
+            stop_loss_trigger = self.position.calc_pl_pct(self.last_price) >= self.STOP_LOSS_PCT
+
+            if take_profit_trigger and price_direction > self.last_price:
+                attempts = 0
+                while attempts < self.ORDERS_MAX_TRIES:
+                    try:
+                        self.long_all_market(status=POS_WIN)
+                        break
+                    except Exception as e:
+                        print(e)
+                        attempts += 1
+            elif stop_loss_trigger and price_direction > self.last_price:
+                attempts = 0
+                while attempts < self.ORDERS_MAX_TRIES:
+                    try:
+                        self.long_all_market(status=POS_LOSS)
+                        break
+                    except Exception as e:
+                        print(e)
+                        attempts += 1
             else:
-                print('ENTRY CRITERIA: NOT MET')
+                # print('NOT MET BUY CONDITIONS')
+                pass
+        elif self.position.side == SIDE_BUY and can_sell and price_mode in ['RESISTANCE']:
+            # print('pl_pct: ', self.position.calc_pl_pct(self.last_price))
+            take_profit_trigger = self.position.calc_pl_pct(self.last_price) >= self.TAKE_PROFIT_PCT
+            stop_loss_trigger = self.position.calc_pl_pct(self.last_price) <= self.STOP_LOSS_PCT
 
+            if take_profit_trigger and price_direction <= self.last_price and price_mode in ['RESISTANCE']:
+                attempts = 0
+                while attempts < self.ORDERS_MAX_TRIES:
+                    try:
+                        self.short_all_market()
+                        break
+                    except Exception as e:
+                        print(e)
+                        attempts += 1
+            elif stop_loss_trigger and price_direction < self.last_price:
+                attempts = 0
+                while attempts < self.ORDERS_MAX_TRIES:
+                    try:
+                        self.short_all_market()
+                        break
+                    except Exception as e:
+                        print(e)
+                        attempts += 1
+            else:
+                # print('NOT MET SELL CONDITIONS')
+                pass
+        
     
-    def long_all_market(self):
+    def long_all_market(self, side_effect=NO_SIDE_EFFECT_TYPE, status=POS_WIN):
+        # get_max_margin_order_quantity
         current_price = self.current_price
         txn_fee = ((self.balance['USDT'] / current_price) * self.fees_pct)
-        btc_qty = (self.balance['USDT'] / current_price) - txn_fee
+        btc_qty = (self.balance['USDT'] / current_price)
+        quantity = truncate(btc_qty, n=5)
         try:
             order = self.rest_client.create_margin_order(
                 symbol=BTCUSDT, 
                 side=SIDE_BUY, 
                 type=ORDER_TYPE_MARKET, 
-                isIsolated=self.is_isolated_margin, 
-                quantity=self._BTC_QTY_PRECISION % btc_qty
+                isIsolated=self.is_isolated_margin,
+                # sideEffectType=MARGIN_BUY_TYPE,
+                sideEffectType=side_effect,
+                quantity=quantity
             )
             self.orders.append(order)
             print('ORDER: ', order)
+            commission = sum([f['commission'] for f in order['fills']])
+            avg_price = sum([f['price'] for f in order['fills']]) / len(order['fills'])
+
+            if status == POS_WIN:
+                print('CLOSING>  @  TAKE-PROFIT     SIDE: %s' % (order['side']))
+                self.position.take_profit(price=avg_price, commission=commission)
+                self.trades.append(self.position)
+            elif status == POS_LOSS:
+                print('CLOSING>  @  STOP-LOSS     SIDE: %s' % (order['side']))
+                self.position.stop_loss(price=avg_price, commission=commission)
+                self.trades.append(self.position)
 
             self.position = Position(open_price=current_price, btc_qty=btc_qty, side=SIDE_BUY, fees_pct=self.fees_pct)
-            print('BUY# Price: %f   Qty: %f  TXN Fee: %f' % (self.position.open_price, btc_qty, txn_fee))
+            print('LONG# Price: %f   Qty: %f  TXN Fee: %f' % (self.position.open_price, btc_qty, txn_fee))
             print(self.position.__dict__)
-            self.init_margin_balance()
+            self.init_cross_margin_balance()
         except Exception as e:
             print(e)
-            import pdb;pdb.set_trace()
+            # import pdb;pdb.set_trace()
     
-    def short_all_market(self):
+    def short_all_market(self, side_effect=NO_SIDE_EFFECT_TYPE, status=POS_WIN):
         current_price = self.current_price
-        txn_fee_in_btc = self.fees_pct * self.balance['BTC']
+        txn_fee = self.fees_pct * self.balance['BTC']
         btc_qty = self.balance['BTC']
+        quantity = truncate(btc_qty, n=5)
+
         try:
             order = self.rest_client.create_margin_order(
                 symbol=BTCUSDT, 
                 side=SIDE_SELL, 
                 type=ORDER_TYPE_MARKET, 
                 isIsolated=self.is_isolated_margin, 
-                quantity=self._BTC_QTY_PRECISION % btc_qty
+                sideEffectType=side_effect,
+                quantity=quantity
             )
             self.orders.append(order)
             print('ORDER: ', order)
+            commission = sum([f['commission'] for f in order['fills']])
+            avg_price = sum([f['price'] for f in order['fills']]) / len(order['fills'])
+            if status == POS_WIN:
+                print('CLOSING>  @  TAKE-PROFIT     SIDE: %s' % (order['side']))
+                self.position.take_profit(price=avg_price, commission=commission)
+                self.trades.append(self.position)
+            elif status == POS_LOSS:
+                print('CLOSING>  @  STOP-LOSS     SIDE: %s' % (order['side']))
+                self.position.stop_loss(price=avg_price, commission=commission)
+                self.trades.append(self.position)
 
+            
             self.position = Position(open_price=current_price, btc_qty=btc_qty, side=SIDE_SELL, fees_pct=self.fees_pct)
-            print('BUY# Price: %f   Qty: %f  TXN Fee: %f' % (self.position.open_price, btc_qty, txn_fee_in_btc))
+            print('SHORT# Price: %f   Qty: %f  TXN Fee: %f' % (self.position.open_price, btc_qty, txn_fee))
             print(self.position.__dict__)
-            self.init_margin_balance()
+            self.init_cross_margin_balance()
         except Exception as e:
             print(e)
-            import pdb;pdb.set_trace()
-
-
-
-    def buy_all_market(self):
-        current_price = self.current_price
-        
-        txn_fee = self.fees_pct * self.balance__spot['USDT']
-        quote_qty_order = self.balance__spot['USDT'] - txn_fee
-
-        btc_qty = (self.balance__spot['USDT'] / current_price) - ((self.balance__spot['USDT'] / current_price) * self.fees_pct)
-        print('quote_qty_order: ', quote_qty_order)
-
-        order = self.rest_client.order_market_buy(symbol=BTCUSDT, quoteOrderQty='%.2f' % quote_qty_order)
-
-        self.position = Position(open_price=current_price, btc_qty=btc_qty, side=SIDE_BUY, fees_pct=self.fees_pct)
-        print('BUY# Price: %f   Qty: %s  TXN Fee: %f' % (self.position.open_price, quote_qty_order, txn_fee))
-        print(self.position.__dict__)
-        self.orders.append(order)
-        print('ORDER: ', order)
-        self.init_balance()
-        # self._balance = None
-
-    def sell_all_market(self):
-        current_price = self.current_price
-        balance_btc_in_usdt = (self.balance__spot['BTC'] * current_price)
-        txn_fee = self.fees_pct * balance_btc_in_usdt
-
-        quote_qty_order = truncate((balance_btc_in_usdt - txn_fee), 2)
-
-        btc_qty = self.balance__spot['BTC']
-        print('quote_qty_order: ', quote_qty_order)
-
-        order = self.rest_client.order_market_sell(symbol=BTCUSDT, quoteOrderQty='%.2f' % quote_qty_order)
-
-        current_price = self.current_price
-        self.position = Position(open_price=current_price, btc_qty=btc_qty, side=SIDE_SELL, fees_pct=self.fees_pct)
-        print('SELL# Price: %f   Qty: %s  TXN Fee: %f' % (self.position.open_price, quote_qty_order, txn_fee))
-        print(self.position.__dict__)
-        self.orders.append(order)
-        print('ORDER: ', order)
-        self.init_balance()
-        # self._balance = None
 
     @property
     def cannot_enter(self):
@@ -393,6 +397,22 @@ class DarkSteps(Strategy):
         ]
         return filters
     
+    @property
+    def trailing_stop_loss_trigger(self):
+        try:
+            price_difference_pct = diff_pct(self.highest_high_price, self.last_price)
+            print('TSL>     Highest High: %.2f      Diff HH PCT:    %.2f <= %.2f' % (
+                self.highest_high_price, price_difference_pct, self.STOP_LOSS_PCT
+            ))
+            self.highest_high_price = max(self.highest_high_price, self.last_price)
+            if price_difference_pct <= self.STOP_LOSS_PCT:
+                return True
+            else:
+                return False
+        except Exception as ex:
+            print(ex)
+            return False
+    
 
     def analyze_depth(self):
 
@@ -401,7 +421,7 @@ class DarkSteps(Strategy):
         nearest_resistance_price = find_nearest_price(resistance_prices, self.last_price)
         nearest_support_price = find_nearest_price(support_prices, self.last_price)
 
-        print('DEPTH>   SUPPORT: %.2f     RESISTANCE: %.2f' % (nearest_support_price, nearest_resistance_price))
+        # print('DEPTH>   SUPPORT: %.2f     RESISTANCE: %.2f' % (nearest_support_price, nearest_resistance_price))
 
         price_direction = 0
         price_mode = 'SUPPORT'

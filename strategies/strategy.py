@@ -1,6 +1,8 @@
 import sys
 import time
 import pandas as pd
+
+from datetime import datetime
 from decimal import Decimal
 from binance.enums import *
 from models.depth import depth_kmeans
@@ -21,6 +23,7 @@ class Position:
         self.side = side
         self.status = None
         self.fees_pct = fees_pct
+        self.commission = Decimal('0.00000000')
     
     @property
     def pl(self):
@@ -28,9 +31,9 @@ class Position:
             raise Exception('Position.close() must be called before Position.pl')
         # only price diff, no total
         if self.side == SIDE_BUY:
-            return ((self.open_price - self.close_price) * self.btc_qty) - self.fees
+            return ((self.open_price - self.close_price) * self.btc_qty) - self.commission
         elif self.side == SIDE_SELL:
-            pl = ((self.open_price - self.close_price) * self.btc_qty) - self.fees
+            pl = ((self.open_price - self.close_price) * self.btc_qty) - self.commission
             if pl < 0:
                 return abs(pl)
             else:
@@ -52,24 +55,26 @@ class Position:
         '''
         return (((last_price - self.close_price) / self.close_price) * Decimal('100')) - self.fees_pct
 
-    @property
-    def fees(self) -> Decimal:
-        if self.status in [POS_INIT]:
-            return Decimal('0.00')
-        if self.close_price is None:
-            raise Exception('Position.close() must be called before Position.fees')
-        return -1 * (self.btc_qty * self.close_price) * self.fees_pct
+    # @property
+    # def fees(self) -> Decimal:
+    #     if self.status in [POS_INIT]:
+    #         # get the fee from the last_order always
+    #         return Decimal('0.00')
+    #     if self.close_price is None:
+    #         raise Exception('Position.close() must be called before Position.fees')
+    #     return -1 * (self.btc_qty * self.close_price) * self.fees_pct
 
-    def close(self, current_price, status) -> None:
+    def close(self, price, status, commission) -> None:
         self.close_ts = ts_now()
-        self.close_price = current_price
+        self.close_price = price
         self.status = status
+        self.commission = commission
     
-    def take_profit(self, current_price) -> None:
-        self.close(current_price, POS_WIN)
+    def take_profit(self, price, commission) -> None:
+        self.close(price, POS_WIN, commission)
 
-    def stop_loss(self, current_price) -> None:
-        self.close(current_price, POS_LOSS)
+    def stop_loss(self, price, commission) -> None:
+        self.close(price, POS_LOSS, commission)
 
     def to_dict(self) -> dict:
         return {
@@ -77,10 +82,10 @@ class Position:
             'close_ts': self.close_ts,
             'open': self.open_price,
             'close': self.close_price,
-            'fees': self.fees,
             'btc_qty': self.btc_qty,
             'side': self.side,
-            'status': self.status
+            'status': self.status,
+            'commission': self.commission
         }
 
 
@@ -90,6 +95,7 @@ class Strategy:
             self, 
             rest_client, 
             testing=True, 
+            margin_testing=False,
             is_isolated_margin=False, 
             is_cross_margin=False,
             leverage=1, 
@@ -97,30 +103,39 @@ class Strategy:
             fees_pct=Decimal('0.10'), 
             stop_loss_pct=Decimal('0.1'), 
             take_profit_pct=Decimal('0.2'),
+            min_profitable_pct=Decimal('0.12'),
             trades_history=None
         ):
         self.WARM_UP_THRESHOLD = warm_up_threshold
         self.rest_client = rest_client
         self.testing = testing
+        self.margin_testing = margin_testing
         # self.dataset_raw_dicts = []
         self.dataset = pd.DataFrame(columns=['ts', 'price', 'qty'], index=['ts',])
         self.dataset = self.dataset.dropna()
         self.depth_dataset = {}
         self.depth_supports, self.depth_resistances = [], []
         
-        self.last_price = 0
+        self.last_price = Decimal('0.0')
+        self.highest_high_price = Decimal('0.0')
+
         self.position = None
         self.trades = []
         self.orders = []
         self.balance__spot = {'BTC': 0, 'USDT': 0}
         self.balance__cross_margin = {'BTC': 0, 'USDT': 0}
         self.fees_pct = fees_pct
+        
         self.STOP_LOSS_PCT = stop_loss_pct
         self.TAKE_PROFIT_PCT = take_profit_pct
+        self.MIN_PROFITABLE_PCT = min_profitable_pct
         
         self.is_isolated_margin = is_isolated_margin
         self.is_cross_margin = is_cross_margin
         self.leverage = leverage
+
+        self.time__started = datetime.now()
+        self.time__current = datetime.now()
 
         # self.trades_history = trades_history
         if self.is_cross_margin:
@@ -129,6 +144,8 @@ class Strategy:
             self.init_isolated_margin_balance()
         else:
             self.init_spot_balance()
+        print('INIT BALANCE>    ', self.balance)
+        print('-' * 160)
 
 
     @property
@@ -146,6 +163,7 @@ class Strategy:
             # self.dataset_raw_dicts.append(data)
             # self.dataset = pd.DataFrame.from_dict(self.dataset_raw_dicts)
             # self.dataset.set_index(['ts'], inplace=True)
+            self.time__current = datetime.now()
         except Exception as ex:
             print(ex)
             if 'e' in record:
@@ -155,6 +173,7 @@ class Strategy:
         else:
             self.dataset = pd.concat([self.dataset[-self.WARM_UP_THRESHOLD:], pd.DataFrame(data, columns=['ts', 'price', 'qty'], index=['ts',])])
             self.last_price = Decimal(data['price'])
+            
 
     def update_cross_margin_balance(self, data):
         '''
@@ -168,33 +187,31 @@ class Strategy:
         if 'e' in data and data['e'] in ['outboundAccountPosition']:
             for wallet in data['B']:
                 if wallet['a'] == 'BTC':
-                    self.balance__cross_margin['BTC'] = wallet['f']
+                    self.balance__cross_margin['BTC'] = Decimal(wallet['f'])
                 elif wallet['a'] == 'USDT':
-                    self.balance__cross_margin['USDT'] = wallet['f']
+                    self.balance__cross_margin['USDT'] = Decimal(wallet['f'])
         print('update_cross_margin_balance: ', data)
 
     def update_spot_balance(self, msg):
         if msg['e'] == 'balanceUpdate':
             if msg['a'] == 'btc':
-                self.balance__spot['BTC'] = msg['d']['a']
+                self.balance__spot['BTC'] = Decimal(msg['d']['a'])
             elif msg['a'] == 'usdt':
-                self.balance__spot['USDT'] = msg['d']['a']
+                self.balance__spot['USDT'] = Decimal(msg['d']['a'])
         print('UPDATED BALANCE: ', self.balance__spot)
 
     def next(self, trade_price_data):
         self.update_price_dataset(trade_price_data)
         if len(self.dataset.index) > self.WARM_UP_THRESHOLD:
             self.update_indicators()
-            print('-' * 100)
+            print('=' * 160)
             self.bid()
-            self.report()
-            print('-' * 100)
         else:
             sys.stdout.write('Warming up with new data... (%d/%d)\r' % (len(self.dataset.index), self.WARM_UP_THRESHOLD))
             sys.stdout.flush()
 
     def update_depth(self, data):
-        print('update_depth: ', data)
+        # print('update_depth: ', data)
         if self.is_cross_margin:
             self.depth_dataset = {'bids': data['b'], 'asks': data['a']}
         else:
@@ -213,16 +230,17 @@ class Strategy:
     def trades_history(self):
         return pd.DataFrame(
             [position.to_dict() for position in self.trades], 
-            columns=['open_ts', 'close_ts', 'open', 'close', 'fees', 'btc_qty', 'side', 'status']
+            columns=['open_ts', 'close_ts', 'open', 'close', 'btc_qty', 'side', 'status', 'commission']
         )
 
     def init_cross_margin_balance(self):
         assets = self.rest_client.get_margin_account()['userAssets']
+        self.highest_high_price = self.last_price
         for asset in assets:
             if asset['asset'] == 'BTC':
-                self.balance__cross_margin['BTC'] = asset['free']
+                self.balance__cross_margin['BTC'] = Decimal(asset['free'])
             elif asset['asset'] == 'USDT':
-                self.balance__cross_margin['USDT'] = asset['free']
+                self.balance__cross_margin['USDT'] = Decimal(asset['free'])
         return self.balance__cross_margin
 
     def init_isolated_margin_balance(self):
@@ -240,7 +258,6 @@ class Strategy:
             'BTC': Decimal(btc_balance['free']),
             'USDT': Decimal(usdt_balance['free']),
         }
-        print('Initializing Balance: ', self.balance__spot)
         return self.balance__spot
     
     @property
@@ -260,18 +277,6 @@ class Strategy:
             elif self.balance['BTC'] > self.BALANCE_MIN_BTC:
                 return SIDE_SELL
 
-    def report(self):
-        print('WINS: %d     LOSSES: %d' % (
-                sum(1 if t == POS_WIN else 0 for t in list(self.trades_history.status)),
-                sum(1 if t == POS_LOSS else 0 for t in list(self.trades_history.status))
-        ))
-        if self.is_cross_margin:
-            print('CROSS MARGIN BALANCE>    {BTC:.8f} BTC   {USDT:.2f} USDT'.format(**self.balance__cross_margin))
-        else:
-            print('SPOT BALANCE>    {BTC:.8f} BTC   {USDT:.2f} USDT'.format(**self.balance__spot))
-    #     trades_summary = self.summarize_trades()
-    #     print('PROFIT:  {profit_pct:.2f}%   LOSS: {loss_pct:.2f}%   =   NET PL: {net_pl_pct:.2f}%'.format(**trades_summary))
-    #     print('PROFIT:  {profit:.2f}    LOSS: {loss:.2f}    =   NET PL: {net_pl:.2f}'.format(**trades_summary))
 
     def update_indicators(self):
         pass
