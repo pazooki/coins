@@ -9,8 +9,8 @@ def depth_kmeans(depth, n_clusters_limit=10):
     asks = np.array(depth['asks'], dtype=Decimal)
     # return asks, bids
 
-    bids_n_clusters = min([len(bids), n_clusters_limit])
-    asks_n_clusters = min([len(asks), n_clusters_limit])
+    bids_n_clusters = min([len(bids), n_clusters_limit]) or 1
+    asks_n_clusters = min([len(asks), n_clusters_limit]) or 1
 
     try:
 

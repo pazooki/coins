@@ -1,5 +1,5 @@
 import sys
-import time
+import traceback
 import pandas as pd
 
 from datetime import datetime
@@ -103,8 +103,8 @@ class Strategy:
             fees_pct=Decimal('0.10'), 
             stop_loss_pct=Decimal('0.1'), 
             take_profit_pct=Decimal('0.2'),
-            min_profitable_pct=Decimal('0.12'),
-            trades_history=None
+            trades_history=None,
+            logger=None
         ):
         self.WARM_UP_THRESHOLD = warm_up_threshold
         self.rest_client = rest_client
@@ -116,6 +116,7 @@ class Strategy:
         self.depth_dataset = {}
         self.depth_supports, self.depth_resistances = [], []
         
+        self.kline = {}
         self.last_price = Decimal('0.0')
         self.highest_high_price = Decimal('0.0')
 
@@ -128,7 +129,6 @@ class Strategy:
         
         self.STOP_LOSS_PCT = stop_loss_pct
         self.TAKE_PROFIT_PCT = take_profit_pct
-        self.MIN_PROFITABLE_PCT = min_profitable_pct
         
         self.is_isolated_margin = is_isolated_margin
         self.is_cross_margin = is_cross_margin
@@ -137,6 +137,8 @@ class Strategy:
         self.time__started = datetime.now()
         self.time__current = datetime.now()
 
+        self.logger = logger
+
         # self.trades_history = trades_history
         if self.is_cross_margin:
             self.init_cross_margin_balance()
@@ -144,9 +146,24 @@ class Strategy:
             self.init_isolated_margin_balance()
         else:
             self.init_spot_balance()
-        print('INIT BALANCE>    ', self.balance)
-        print('-' * 160)
+        self.logger.log('INIT BALANCE>    {BTC} BTC     {USDT} USDT'.format(**self.balance))
+        self.logger.log('-' * 160)
 
+
+    def call_until_executed(self, func, params):
+        attempts = 0
+        while attempts < self.ORDERS_MAX_TRIES:
+            try:
+                func(**params)
+                break
+            except Exception as e:
+                self.logger.log(traceback.format_exc())
+                self.logger.log(e)
+                attempts += 1
+
+    @property
+    def has_no_trades(self):
+        return len(self.trades) == 0
 
     @property
     def current_price(self):
@@ -165,10 +182,11 @@ class Strategy:
             # self.dataset.set_index(['ts'], inplace=True)
             self.time__current = datetime.now()
         except Exception as ex:
-            print(ex)
+            self.logger.log(ex)
+            self.logger.log(record)
             if 'e' in record:
-                print('Errors: ', record['m'])
-                print('Exiting...')
+                self.logger.log('Errors: %s' % record['m'])
+                self.logger.log('Exiting...')
                 sys.exit(-1)
         else:
             self.dataset = pd.concat([self.dataset[-self.WARM_UP_THRESHOLD:], pd.DataFrame(data, columns=['ts', 'price', 'qty'], index=['ts',])])
@@ -190,7 +208,7 @@ class Strategy:
                     self.balance__cross_margin['BTC'] = Decimal(wallet['f'])
                 elif wallet['a'] == 'USDT':
                     self.balance__cross_margin['USDT'] = Decimal(wallet['f'])
-        print('update_cross_margin_balance: ', data)
+        self.logger.log('update_cross_margin_balance: %s' % data)
 
     def update_spot_balance(self, msg):
         if msg['e'] == 'balanceUpdate':
@@ -198,33 +216,68 @@ class Strategy:
                 self.balance__spot['BTC'] = Decimal(msg['d']['a'])
             elif msg['a'] == 'usdt':
                 self.balance__spot['USDT'] = Decimal(msg['d']['a'])
-        print('UPDATED BALANCE: ', self.balance__spot)
+        self.logger.log('UPDATED BALANCE: %s' % self.balance__spot)
 
     def next(self, trade_price_data):
         self.update_price_dataset(trade_price_data)
         if len(self.dataset.index) > self.WARM_UP_THRESHOLD:
             self.update_indicators()
-            print('=' * 160)
+            self.logger.log('=' * 160)
             self.bid()
         else:
             sys.stdout.write('Warming up with new data... (%d/%d)\r' % (len(self.dataset.index), self.WARM_UP_THRESHOLD))
             sys.stdout.flush()
 
     def update_depth(self, data):
-        # print('update_depth: ', data)
-        if self.is_cross_margin:
+        if self.is_cross_margin or self.is_isolated_margin:
             self.depth_dataset = {'bids': data['b'], 'asks': data['a']}
         else:
             self.depth_dataset = data
-        # print(self.depth_dataset)
+        # self.logger.log(self.depth_dataset)
         # self.depth_dataset = {'bids': data.get_bids(), 'asks': data.get_asks()}
         # start_time = time.time()
         self.depth_supports, self.depth_resistances = depth_kmeans(self.depth_dataset, n_clusters_limit=5)
         # end_time = time.time()
-        # print("Time: ", (end_time - start_time) * 1000, "milliseconds")
-        # print('supports: ', self.depth_supports)
-        # print('resistances: ', self.depth_resistances)
+        # self.logger.log("Time: ", (end_time - start_time) * 1000, "milliseconds")
+        # self.logger.log('supports: ', self.depth_supports)
+        # self.logger.log('resistances: ', self.depth_resistances)
 
+    def update_kline(self, data):
+        '''
+        {
+            "e": "kline",         // Event type
+            "E": 1672515782136,   // Event time
+            "s": "BNBBTC",        // Symbol
+            "k": {
+                "t": 1672515780000, // Kline start time
+                "T": 1672515839999, // Kline close time
+                "s": "BNBBTC",      // Symbol
+                "i": "1m",          // Interval
+                "f": 100,           // First trade ID
+                "L": 200,           // Last trade ID
+                "o": "0.0010",      // Open price
+                "c": "0.0020",      // Close price
+                "h": "0.0025",      // High price
+                "l": "0.0015",      // Low price
+                "v": "1000",        // Base asset volume
+                "n": 100,           // Number of trades
+                "x": false,         // Is this kline closed?
+                "q": "1.0000",      // Quote asset volume
+                "V": "500",         // Taker buy base asset volume
+                "Q": "0.500",       // Taker buy quote asset volume
+                "B": "123456"       // Ignore
+            }
+        }
+        features = ['Open', 'High', 'Low', 'Close', 'Volume', 'Trades']
+        '''
+        self.kline = dict(
+            Open = [Decimal(data['k']['o'])],
+            High = [Decimal(data['k']['h'])],
+            Low = [Decimal(data['k']['l'])],
+            Close = [Decimal(data['k']['c'])],
+            Volume = [Decimal(data['k']['v'])],
+            Trades = [data['k']['n']]
+        )
     
     @property
     def trades_history(self):
@@ -245,11 +298,11 @@ class Strategy:
 
     def init_isolated_margin_balance(self):
         assets = self.rest_client.get_isolated_margin_account()['assets'][0]
-        self.isolated_margin_balance = {
-            'BTC': assets['baseAsset'],
-            'USDT': assets['quoteAsset']
+        self.balance__isolated_margin = {
+            'BTC': Decimal(assets['baseAsset']['totalAsset']),
+            'USDT': Decimal(assets['quoteAsset']['totalAsset'])
         }
-        return self.isolated_margin_balance
+        return self.balance__isolated_margin
     
     def init_spot_balance(self):
         btc_balance = self.rest_client.get_asset_balance(asset='BTC')
@@ -262,7 +315,9 @@ class Strategy:
     
     @property
     def balance(self):
-        if self.is_cross_margin:
+        if self.is_isolated_margin:
+            return self.balance__isolated_margin
+        elif self.is_cross_margin:
             return self.balance__cross_margin
         else:
             return self.balance__spot

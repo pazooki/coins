@@ -4,11 +4,15 @@ from binance.enums import *
 from optparse import OptionParser
 
 import pandas as pd
+import traceback
 
 from config import CONFIG, TESTNET_CONFIG
 from utils import ts_filename
-from strategies.dark_steps import DarkSteps
+from strategies.mach1 import Mach1
 
+from utils import Logger
+
+logger = Logger()
 
 BTCUSDT = 'BTCUSDT'
 
@@ -19,8 +23,14 @@ def main(strategy, is_testing):
     # dcm = ThreadedDepthCacheManager(api_key=config['API_KEY'], api_secret=config['API_SECRET'], testnet=is_testing)
     # dcm.start()
     twm.start()
-    if strategy.is_cross_margin:
-        twm.start_depth_socket(callback=strategy.update_depth, symbol=BTCUSDT)
+    if strategy.is_isolated_margin:
+        # twm.start_depth_socket(callback=strategy.update_depth, symbol=BTCUSDT)
+        twm.start_kline_socket(callback=strategy.update_kline, symbol=BTCUSDT)
+        twm.start_aggtrade_socket(callback=strategy.next, symbol=BTCUSDT)
+        twm.start_margin_socket(callback=strategy.update_cross_margin_balance)
+    elif strategy.is_cross_margin:
+        # twm.start_depth_socket(callback=strategy.update_depth, symbol=BTCUSDT)
+        twm.start_kline_socket(callback=strategy.update_kline, symbol=BTCUSDT)
         twm.start_aggtrade_socket(callback=strategy.next, symbol=BTCUSDT)
         twm.start_margin_socket(callback=strategy.update_cross_margin_balance)
     else:
@@ -44,9 +54,8 @@ if __name__ == "__main__":
     parser.add_option("--margin-buy-all", action="store_true", dest="margin_buy_all", default=False, help="Enable 10x isolated margin")
 
     parser.add_option("--leverage", dest="leverage", default=1, help="Leverage multiplier")
-    parser.add_option("--tp-pct", dest="tp_pct", default=Decimal('0.34'), help="Leverage multiplier")
-    parser.add_option("--sl-pct", dest="sl_pct", default=Decimal('0.34'), help="Leverage multiplier")
-    parser.add_option("--min-profitable-pct", dest="min_profitable_pct", default=Decimal('0.12'), help="Leverage multiplier")
+    parser.add_option("--tp-pct", dest="tp_pct", default=Decimal('0.34'), help="Take Profit %")
+    parser.add_option("--sl-pct", dest="sl_pct", default=Decimal('0.34'), help="Stop Loss %")
     (options, args) = parser.parse_args()
 
     print('Mode: ', 'Test' if options.testing else 'Live')
@@ -61,9 +70,8 @@ if __name__ == "__main__":
 
     tp_pct = Decimal(options.tp_pct)
     sl_pct = Decimal(options.sl_pct)
-    min_profitable_pct= Decimal(options.min_profitable_pct)
 
-    strategy = DarkSteps(
+    strategy = Mach1(
         rest_client=client,
         testing=IS_TESTING,
         margin_testing=options.margin_testing,
@@ -76,9 +84,9 @@ if __name__ == "__main__":
         # -0.2 and 0.7 best backtesting results
         stop_loss_pct=-1 * sl_pct,
         take_profit_pct=tp_pct,
-        min_profitable_pct=min_profitable_pct,
         # model_rfr=model_rfr,
-        trades_history=[]
+        trades_history=[],
+        logger=logger
     )
     try:
         if options.trade:
@@ -89,9 +97,10 @@ if __name__ == "__main__":
         else:
             main(strategy, is_testing=IS_TESTING)
     except (Exception, KeyboardInterrupt) as ex:
-        print(ex)
+        # traceback.print_exc()
+        logger.log(ex)
         trades_history_path = 'data/trades_{ts}{is_testing}.csv'.format(ts=ts_filename(), is_testing='_test' if IS_TESTING or options.margin_testing else '')
         strategy.trades_history.to_csv(trades_history_path, sep=',', encoding='utf-8')
-        print(strategy.trades_history)
-        print(trades_history_path)
+        logger.log(strategy.trades_history)
+        logger.log(trades_history_path)
         # print(strategy.orders)
