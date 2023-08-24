@@ -280,7 +280,7 @@ class Mach1(Strategy):
                 quantity=quantity
             )
             self.orders.append(order)
-            self.logger.log('ORDER: ', order)
+            self.logger.log('ORDER: %s' % order)
             commission = sum([Decimal(f['commission']) for f in order['fills']])
             avg_price = sum([Decimal(f['price']) for f in order['fills']]) / len(order['fills'])
 
@@ -291,6 +291,9 @@ class Mach1(Strategy):
             elif status == POS_LOSS:
                 self.logger.log('CLOSING>  @  STOP-LOSS     SIDE: %s' % (order['side']))
                 self.position.stop_loss(price=avg_price, commission=commission)
+                self.trades.append(self.position)
+            else:
+                self.logger.log('OPENING>  @  PREV     SIDE: %s' % (order['side']))
                 self.trades.append(self.position)
 
             self.position = Position(open_price=current_price, btc_qty=btc_qty, side=SIDE_BUY, fees_pct=self.fees_pct)
@@ -322,9 +325,10 @@ class Mach1(Strategy):
                 quantity=quantity
             )
             self.orders.append(order)
-            self.logger.log('ORDER: ', order)
+            self.logger.log('ORDER: %s' % order)
             commission = sum([Decimal(f['commission']) for f in order['fills']])
             avg_price = sum([Decimal(f['price']) for f in order['fills']]) / len(order['fills'])
+
             if status == POS_WIN:
                 self.logger.log('CLOSING>  @  TAKE-PROFIT     SIDE: %s' % (order['side']))
                 self.position.take_profit(price=avg_price, commission=commission)
@@ -332,6 +336,9 @@ class Mach1(Strategy):
             elif status == POS_LOSS:
                 self.logger.log('CLOSING>  @  STOP-LOSS     SIDE: %s' % (order['side']))
                 self.position.stop_loss(price=avg_price, commission=commission)
+                self.trades.append(self.position)
+            else:
+                self.logger.log('OPENING>  @  PREV     SIDE: %s' % (order['side']))
                 self.trades.append(self.position)
             
             self.position = Position(open_price=current_price, btc_qty=btc_qty, side=SIDE_SELL, fees_pct=self.fees_pct)
